@@ -1,0 +1,625 @@
+
+import os
+import json
+import csv
+import time
+import logging
+import collections
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import joblib
+import requests
+import sqlalchemy as sa
+
+from featurizer import to_features, FEATURE_NAMES
+from threshold import load_threshold
+
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    average_precision_score
+)
+
+# ============================================================
+# 1. LOGGING CONFIGURATION
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# 2. KAFKA CONFIGURATION
+# ============================================================
+
+try:
+    from kafka import KafkaConsumer
+    from kafka.errors import NoBrokersAvailable
+    KAFKA_AVAILABLE = True
+except ImportError:
+    logger.warning("Kafka library unavailable.")
+    KAFKA_AVAILABLE = False
+
+BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
+TOPIC = os.getenv("TOPIC_TRANSACTIONS", "transactions")
+
+# ============================================================
+# 3. OPTIONAL SHAP CONFIGURATION
+# ============================================================
+
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
+SHAP_OK = False
+explainer = None
+
+# ============================================================
+# 4. FILE PATHS AND ENVIRONMENT
+# ============================================================
+
+ALERTS_SINK = os.getenv(
+    "ALERTS_SINK", "/app/data/alerts.csv"
+)
+LATEST_SINK = os.getenv(
+    "LATEST_SINK", "/app/data/latest.csv"
+)
+DRIFT_SINK = os.getenv(
+    "DRIFT_SINK", "/app/data/drift.json"
+)
+
+MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")
+META_PATH = MODEL_PATH.replace(".pkl", "_meta.json")
+DATA_PATH = os.getenv(
+    "DATA_PATH", "/app/data/creditcard.csv"
+)
+
+SLACK = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+DB_URL = os.getenv("DB_URL", "")
+
+# ============================================================
+# 5. LOAD MODEL METADATA
+# ============================================================
+
+MODEL_META = {}
+
+if os.path.exists(META_PATH):
+    try:
+        with open(META_PATH, "r", encoding="utf-8") as f:
+            MODEL_META = json.load(f)
+
+        logger.info("Model metadata: %s", MODEL_META)
+
+    except Exception:
+        logger.exception("Could not load model metadata.")
+
+# ============================================================
+# 6. CREATE OUTPUT CSV FILES
+# ============================================================
+
+def ensure_csv(path, headers):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    if not os.path.exists(path):
+        with open(
+            path, "w", newline="", encoding="utf-8"
+        ) as f:
+            csv.writer(f).writerow(headers)
+
+
+ensure_csv(
+    ALERTS_SINK,
+    ["ts", "prob", *FEATURE_NAMES, "top_features_json"]
+)
+
+ensure_csv(
+    LATEST_SINK,
+    ["ts", "prob", *FEATURE_NAMES, "is_alert"]
+)
+
+# ============================================================
+# 7. LOAD TRAINED MODEL
+# ============================================================
+
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"Model not found: {MODEL_PATH}. "
+        "Check MODEL_PATH and your Docker image."
+    )
+
+model = joblib.load(MODEL_PATH)
+logger.info("Model loaded successfully: %s", MODEL_PATH)
+
+# ============================================================
+# 8. OPTIONAL SHAP EXPLAINABILITY
+# ============================================================
+
+if SHAP_AVAILABLE:
+    try:
+        shap_model = (
+            model.estimators_[0]
+            if hasattr(model, "estimators_")
+            else model
+        )
+
+        explainer = shap.TreeExplainer(shap_model)
+        SHAP_OK = True
+        logger.info("SHAP explanation enabled.")
+
+    except Exception as e:
+        logger.warning("SHAP unavailable: %s", e)
+
+# ============================================================
+# 9. DATABASE CONNECTION
+# ============================================================
+
+engine = None
+
+if DB_URL:
+    try:
+        engine = sa.create_engine(
+            DB_URL, pool_pre_ping=True
+        )
+
+        with engine.connect() as connection:
+            connection.execute(sa.text("SELECT 1"))
+
+        logger.info("Database connected successfully.")
+
+    except Exception as e:
+        logger.warning("Database connection failed: %s", e)
+        engine = None
+
+# ============================================================
+# 10. ROLLING DRIFT TRACKING
+# ============================================================
+
+WINDOW_SIZE = 500
+score_window = collections.deque(maxlen=WINDOW_SIZE)
+drift_counter = 0
+DRIFT_WRITE_EVERY = 50
+
+
+def write_drift(prob):
+    global drift_counter
+
+    score_window.append(prob)
+    drift_counter += 1
+
+    if drift_counter % DRIFT_WRITE_EVERY != 0:
+        return
+
+    if len(score_window) < 10:
+        return
+
+    scores = list(score_window)
+    threshold = load_threshold()
+
+    rolling_alert_rate = float(
+        np.mean([score >= threshold for score in scores])
+    )
+
+    baseline = (
+        MODEL_META.get("fraud_rate_pct", 0.172) / 100.0
+    )
+
+    drift_ratio = rolling_alert_rate / (baseline + 1e-9)
+
+    if drift_ratio > 3.0:
+        drift_status = "high"
+    elif drift_ratio > 1.5:
+        drift_status = "elevated"
+    else:
+        drift_status = "stable"
+
+    payload = {
+        "ts": datetime.utcnow().isoformat(
+            timespec="seconds"
+        ) + "Z",
+        "window_size": len(scores),
+        "rolling_alert_rate": round(rolling_alert_rate, 4),
+        "baseline_fraud_rate": round(baseline, 4),
+        "drift_ratio": round(drift_ratio, 3),
+        "drift_status": drift_status,
+        "mean_score": round(float(np.mean(scores)), 4),
+        "p95_score": round(
+            float(np.percentile(scores, 95)), 4
+        ),
+        "model_f1": MODEL_META.get("f1", "N/A"),
+        "model_name": MODEL_META.get("model", "unknown")
+    }
+
+    directory = os.path.dirname(DRIFT_SINK) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    with open(DRIFT_SINK, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    if drift_status != "stable":
+        logger.warning(
+            "DRIFT %s: ratio=%.2f rolling_rate=%.4f",
+            drift_status, drift_ratio, rolling_alert_rate
+        )
+
+# ============================================================
+# 11. SHAP FEATURE EXPLANATIONS
+# ============================================================
+
+def top_shap(x):
+    if not SHAP_OK:
+        return []
+
+    try:
+        values = explainer.shap_values(x.reshape(1, -1))
+
+        if isinstance(values, list):
+            values = values[-1]
+
+        values = np.asarray(values)
+
+        if values.ndim == 3:
+            values = values[0, :, -1]
+        elif values.ndim == 2:
+            values = values[0]
+
+        indices = np.argsort(np.abs(values))[::-1][:5]
+
+        return [
+            {
+                "feature": FEATURE_NAMES[i],
+                "contribution": float(values[i])
+            }
+            for i in indices
+        ]
+
+    except Exception as e:
+        logger.warning("SHAP calculation failed: %s", e)
+        return []
+
+# ============================================================
+# 12. FRAUD PROBABILITY
+# ============================================================
+
+def predict_transaction(rec):
+    x = np.asarray(to_features(rec), dtype=float).reshape(1, -1)
+
+    if hasattr(model, "predict_proba"):
+        probabilities = model.predict_proba(x)[0]
+
+        classes = list(model.classes_)
+
+        if 1 in classes:
+            fraud_index = classes.index(1)
+            prob = float(probabilities[fraud_index])
+        else:
+            prob = 0.0
+
+    else:
+        prediction = int(model.predict(x)[0])
+        prob = float(prediction)
+
+    threshold = load_threshold()
+    is_alert = prob >= threshold
+
+    return x, prob, threshold, is_alert
+
+# ============================================================
+# 13. SLACK ALERTS
+# ============================================================
+
+def send_slack_alert(prob, amount, timestamp, features):
+    if not SLACK:
+        return
+
+    drivers = ", ".join(
+        f"{item['feature']}={item['contribution']:.3f}"
+        for item in features
+    )
+
+    payload = {
+        "text": (
+            f"🚨 FRAUD ALERT | Probability: {prob:.3f}"
+            f" | Amount: {amount:.2f}"
+            f" | Time: {timestamp}"
+            f" | Features: {drivers}"
+        )
+    }
+
+    try:
+        response = requests.post(
+            SLACK, json=payload, timeout=5
+        )
+        response.raise_for_status()
+
+    except Exception as e:
+        logger.warning("Slack alert failed: %s", e)
+
+# ============================================================
+# 14. PROCESS A REAL-TIME TRANSACTION
+# ============================================================
+
+def process_transaction(rec):
+    timestamp = datetime.utcnow().isoformat(
+        timespec="seconds"
+    ) + "Z"
+
+    x, prob, threshold, is_alert = predict_transaction(rec)
+    amount = float(rec.get("Amount", 0.0))
+
+    features = top_shap(x[0])
+
+    print(
+        f"{'🚨 FRAUD' if is_alert else '✅ SAFE'}"
+        f" | Amount: {amount:.2f}"
+        f" | Prob: {prob:.4f}"
+        f" | Threshold: {threshold:.4f}",
+        flush=True
+    )
+
+    write_drift(prob)
+    
+    # Save every processed transaction for the dashboard
+    try:
+        row = {
+            "ts": timestamp,
+            "prob": float(prob),
+            "Amount": amount,
+            **{
+                name: float(rec.get(name, 0.0))
+                for name in FEATURE_NAMES
+            },
+            "is_alert": bool(is_alert),
+        }
+
+        file_exists = os.path.exists(LATEST_SINK)
+        with open(LATEST_SINK, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["ts", "prob", *FEATURE_NAMES, "is_alert"],
+                extrasaction="ignore",
+            )
+            writer.writerow(row)
+
+    except Exception:
+        logger.exception("Failed to save transaction to CSV.")
+
+
+    if is_alert:
+        # Save the alert to PostgreSQL
+        if engine is not None:
+            try:
+                with engine.begin() as connection:
+                    connection.execute(
+                        sa.text("""
+                            INSERT INTO alerts
+                                (ts, prob, amount, features, shap)
+                            VALUES
+                                (:ts, :prob, :amount,
+                                 CAST(:features AS jsonb),
+                                 CAST(:shap AS jsonb))
+                        """),
+                        {
+                            "ts": timestamp,
+                            "prob": float(prob),
+                            "amount": amount,
+                            "features": json.dumps(
+                                x[0].tolist()
+                            ),
+                            "shap": json.dumps(
+                                features if features is not None else []
+                            )
+                        }
+                    )
+                logger.info("Fraud alert saved to PostgreSQL.")
+
+            except Exception:
+                logger.exception("Failed to save fraud alert to PostgreSQL.")
+
+        else:
+            logger.warning("Database unavailable; alert not saved.")
+
+        send_slack_alert(
+            prob, amount, timestamp, features
+        )
+
+    return prob, is_alert
+
+# ============================================================
+# 15. KAFKA CONNECTION WITH RETRIES
+# ============================================================
+
+def create_consumer_with_retry():
+    for attempt in range(1, 7):
+        try:
+            logger.info(
+                "Connecting to Kafka %s (attempt %d/6)",
+                BROKER, attempt
+            )
+
+            consumer = KafkaConsumer(
+                TOPIC,
+                bootstrap_servers=[BROKER],
+                value_deserializer=lambda message: json.loads(
+                    message.decode("utf-8")
+                ),
+                auto_offset_reset="latest",
+                enable_auto_commit=True,
+                group_id="fraud_processor",
+                request_timeout_ms=30000,
+                api_version_auto_timeout_ms=5000
+            )
+
+            logger.info("Kafka connected successfully.")
+            return consumer
+
+        except Exception as e:
+            logger.warning("Kafka connection failed: %s", e)
+
+            if attempt < 6:
+                time.sleep(5)
+
+    return None
+
+# ============================================================
+# 16. LOCAL SIMULATION: RANDOM 1,000 TRANSACTIONS
+# ============================================================
+
+def run_local_simulation():
+    logger.info("Running local dataset simulation.")
+
+    if not os.path.exists(DATA_PATH):
+        logger.error("Dataset not found: %s", DATA_PATH)
+        return
+
+    df = pd.read_csv(DATA_PATH)
+
+    if "Class" not in df.columns:
+        logger.error("Dataset is missing the Class column.")
+        return
+
+    if df.empty:
+        logger.error("Dataset is empty.")
+        return
+
+    # Select up to 1,000 random transactions.
+    # This keeps the natural class distribution.
+    sample_size = min(1000, len(df))
+
+    test_df = df.sample(
+        n=sample_size,
+        random_state=42
+    ).reset_index(drop=True)
+
+    logger.info("Dataset rows: %d", len(df))
+    logger.info("Transactions selected: %d", len(test_df))
+
+    threshold = load_threshold()
+
+    y_true = []
+    y_pred = []
+    y_scores = []
+
+    for index, row in test_df.iterrows():
+        rec = row.to_dict()
+
+        try:
+            prob, is_alert = process_transaction(rec)
+            
+            
+
+            actual = int(rec["Class"])
+            predicted = int(is_alert)
+            amount = float(rec.get("Amount", 0.0))
+
+            y_true.append(actual)
+            y_pred.append(predicted)
+            y_scores.append(prob)
+
+            print(
+                f"{'🚨 FRAUD' if predicted else '✅ SAFE'}"
+                f" | Actual: {actual}"
+                f" | Amount: {amount:.2f}"
+                f" | Prob: {prob:.4f}"
+                f" | Threshold: {threshold:.4f}",
+                flush=True
+            )
+
+            time.sleep(0.05)
+
+        except Exception:
+            logger.exception(
+                "Failed to process simulation row %d", index
+            )
+
+    if not y_true:
+        logger.error("No transactions were successfully processed.")
+        return
+
+    print("\n" + "=" * 60)
+    print("FRAUD DETECTION EVALUATION")
+    print("=" * 60)
+
+    print(f"Transactions evaluated: {len(y_true)}")
+    print(f"Threshold: {threshold:.4f}")
+    print(f"Actual fraud: {sum(y_true)}")
+    print(f"Actual normal: {len(y_true) - sum(y_true)}")
+    print(f"Predicted fraud: {sum(y_pred)}")
+    print(f"Predicted normal: {len(y_pred) - sum(y_pred)}")
+
+    print("\nConfusion Matrix:")
+    print("Rows = actual [SAFE, FRAUD]")
+    print("Columns = predicted [SAFE, FRAUD]")
+    print(confusion_matrix(y_true, y_pred, labels=[0, 1]))
+
+    print("\nClassification Report:")
+    print(classification_report(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+        target_names=["SAFE", "FRAUD"],
+        zero_division=0
+    ))
+
+    if len(set(y_true)) == 2:
+        print(
+            "PR-AUC (Average Precision):",
+            round(
+                average_precision_score(y_true, y_scores), 4
+            )
+        )
+    else:
+        print(
+            "PR-AUC unavailable: sample contains "
+            "only one class."
+        )
+
+    print("=" * 60)
+
+# ============================================================
+# 17. MAIN APPLICATION
+# ============================================================
+
+def main():
+    logger.info("Fraud detection processor starting...")
+
+    consumer = None
+
+    if KAFKA_AVAILABLE:
+        consumer = create_consumer_with_retry()
+
+    if consumer is not None:
+        logger.info("Running in Kafka real-time mode.")
+
+        try:
+            for message in consumer:
+                try:
+                    rec = message.value
+                    process_transaction(rec)
+
+                except Exception:
+                    logger.exception(
+                        "Failed to process Kafka message."
+                    )
+
+        except KeyboardInterrupt:
+            logger.info("Kafka processing stopped.")
+
+        finally:
+            consumer.close()
+
+    else:
+        logger.warning(
+            "Kafka unavailable. Switching to local simulation."
+        )
+        run_local_simulation()
+
+
+if __name__ == "__main__":
+    main()

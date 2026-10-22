@@ -1,0 +1,9 @@
+kafka-python-ng
+pandas
+numpy
+scikit-learn
+joblib
+fastapi
+uvicorn
+requests
+lightgbm

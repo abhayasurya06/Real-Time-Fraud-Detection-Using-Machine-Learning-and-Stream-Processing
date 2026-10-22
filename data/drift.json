@@ -1,0 +1,12 @@
+{
+  "ts": "2026-10-12T18:42:14Z",
+  "window_size": 500,
+  "rolling_alert_rate": 0.0,
+  "baseline_fraud_rate": 0.0017,
+  "drift_ratio": 0.0,
+  "drift_status": "stable",
+  "mean_score": 0.0004,
+  "p95_score": 0.0005,
+  "model_f1": 0.871,
+  "model_name": "VotingClassifier(XGB + LGBM)"
+}
